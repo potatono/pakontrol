@@ -12,7 +12,7 @@ midi_output = False
 pa_type = sink
 pa_match_name = combined_output
 pa_change = volume
-pa_factor = 1.25
+multiplier = 1.25
 
 [Main Mute]
 midi_event = control_change
