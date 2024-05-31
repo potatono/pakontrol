@@ -241,6 +241,9 @@ class PulseAudioControl:
         if rule.pa_change == 'volume':
             volume = min(value / MAX_MIDI_VALUE * rule.pa_factor, MAX_VOLUME)
 
+            if volume == MAX_VOLUME:
+                self.log.warn(f"Will not set volume above {MAX_VOLUME} to prevent damage")
+
             if self.args.interactive and rule != self.i_rule:
                 self.log.info(f"Would set volume of {device} to {volume} (skipped in interactive mode)")
             else:
@@ -450,9 +453,9 @@ class PulseAudioControl:
                     self.i_asked = {}
                     self.print("Use a control on your MIDI device...")
                 else:
-                    with open('pakontrol-new.conf','w') as configfile:
+                    with open('pakontrol.conf.new','w') as configfile:
                         self.i_config.write(configfile)
-                    self.print("Configuration written to pakontrol-new.conf.")
+                    self.print("Configuration written to pakontrol.conf.new.")
                     self.print("Configuration is loaded from ~/.config/pakontrol/pakontrol.conf by default.")
                     sys.exit(0)
     

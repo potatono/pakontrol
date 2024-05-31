@@ -8,6 +8,7 @@ pid_file = ~/.local/logs/pakontrol/pakontrol.pid
 midi_event = control_change
 midi_channel = 0
 midi_control = 5
+midi_output = False
 pa_type = sink
 pa_match_name = combined_output
 pa_change = volume
@@ -21,3 +22,24 @@ midi_output = True
 pa_type = sink
 pa_match_name = combined_output
 pa_change = mute
+
+[Rythmbox Mute]
+midi_event = control_change
+midi_channel = 0
+midi_control = 54
+midi_output = True
+pa_type = sink_input
+pa_change = volume
+pa_match_prop_named = application.name
+pa_match_prop_value = Rythmbox
+
+[Rhythmbox Volume]
+midi_event = control_change
+midi_channel = 0
+midi_control = 6
+midi_output = False
+pa_type = sink_input
+pa_change = volume
+pa_match_prop_named = application.name
+pa_match_prop_value = Rhythmbox
+
