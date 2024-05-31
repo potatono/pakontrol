@@ -1,0 +1,23 @@
+[DEFAULT]
+midi_device = nanoKONTROL2
+midi_output = True
+log_path = ~/.local/logs/pakontrol/pakontrol.log
+pid_file = ~/.local/logs/pakontrol/pakontrol.pid
+
+[Main Volume]
+midi_event = control_change
+midi_channel = 0
+midi_control = 5
+pa_type = sink
+pa_match_name = combined_output
+pa_change = volume
+pa_factor = 1.25
+
+[Main Mute]
+midi_event = control_change
+midi_channel = 0
+midi_control = 53
+midi_output = True
+pa_type = sink
+pa_match_name = combined_output
+pa_change = mute

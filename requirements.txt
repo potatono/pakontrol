@@ -1,0 +1,4 @@
+pulsectl
+mido
+rtmidi
+python-daemon

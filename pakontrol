@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import re
+import signal
+import logging
+import time
+from configparser import ConfigParser
+from argparse import ArgumentParser
+
+import mido
+from mido import Message
+import pulsectl
+import daemon
+import daemon.pidfile
+
+MAX_VOLUME = 1.5        # Refuse to set volume higher than this to prevent damage
+MAX_MIDI_VALUE = 127
+MIN_MIDI_VALUE = 0
+
+class PulseAudioControl:
+    class Rule:
+        midi_event = "control_change"
+        midi_channel = 0
+        midi_control = None
+        midi_output = False
+        pa_type = "sink"
+        pa_match_name = None
+        pa_match_prop_named = None
+        pa_match_prop_value = None
+        pa_change = "volume"
+        pa_factor = 1.0
+
+        def __init__(self, section=None):
+            if section:
+                self.midi_event = section.get('midi_event', 'control_change')
+                self.midi_channel = section.getint('midi_channel', 0)
+                self.midi_control = section.getint('midi_control', None)
+                self.midi_output = section.getboolean('midi_output', False)
+                self.pa_type = section.get('pa_type', 'sink')
+                self.pa_match_name = section.get('pa_match_name', None)
+                self.pa_match_prop_named = section.get('pa_match_prop_named', None)
+                self.pa_match_prop_value = section.get('pa_match_prop_value', None)
+                self.pa_change = section.get('pa_change', 'volume')
+                self.pa_factor = section.getfloat('pa_factor', 1.0)
+        
+        def __str__(self):
+            return (f"midi:{self.midi_event}:{self.midi_channel}:{self.midi_control} "
+                    f"pa:{self.pa_type}:{self.pa_match_name}:"
+                    f"{self.pa_match_prop_named}:{self.pa_match_prop_value} "
+                    f"{self.pa_change}")
+
+    rules = []
+    audio_events = []
+    midi_events = []
+
+    def __init__(self):
+        self.init_args()
+        self.init_config()
+        self.init_logging()
+        self.init_rules()
+        self.init_daemon()
+        self.init_interactive()
+        self.init_midi()
+        self.init_audio()
+
+    def init_args(self):
+        parser = ArgumentParser()
+        parser.add_argument('-v', '--verbose', action='store_true')
+        parser.add_argument('-f', '--config-file')
+        parser.add_argument('-d', '--daemon', action='store_true')
+        parser.add_argument('-i', '--interactive', action='store_true',
+                            help='interactive configuration mode')
+        self.args = parser.parse_args()
+
+        if self.args.interactive and self.args.daemon:
+            print("Specifying interactive and daemon is an invalid combination.")
+            sys.exit(1)
+
+    def init_daemon(self):
+        if self.args.daemon:
+            pidfile = self.config.get('DEFAULT', 'pid_file', fallback=None)
+            logfile = self.config.get('DEFAULT', 'log_path', fallback=None)
+            
+            self.daemon = daemon.DaemonContext()
+            
+            if pidfile:
+                self.daemon.pidfile = daemon.pidfile.PIDLockFile(os.path.expanduser(pidfile))
+
+            if logfile:
+                self.daemon.stderr = self.log_fh.stream
+                self.daemon.stdout = self.log_fh.stream
+                self.daemon.file_preserve = [ self.log_fh.stream ]
+
+            self.daemon.open()
+    
+    def init_interactive(self):
+        if self.args.interactive:
+            self.i_asked = {}
+            self.i_step = "midi"
+            self.i_rule = None
+            self.i_config = ConfigParser()
+            self.i_test_until = None
+
+    def init_config(self):
+        self.config = ConfigParser()
+        if self.args.config_file:
+            self.config.read(self.args.config_file)
+        else:
+            self.config.read("pakontrol.conf")
+            self.config.read(os.path.expanduser("~/.config/pakontrol/pakontrol.conf"))
+
+    def init_logging(self):
+        self.log = logging.getLogger(__name__)
+        path = self.config.get('DEFAULT', 'log_path', fallback=None)
+        level = self.config.get('DEFAULT', 'log_level', fallback='INFO')
+
+        if self.args.verbose:
+            level = 'DEBUG'
+
+        format = self.config.get('DEFAULT', 'log_format', fallback='[%(asctime)s %(levelname)s] %(message)s')
+
+        logging.basicConfig(level=logging.getLevelName(level), format=format)
+
+        if path:
+            path = os.path.expanduser(path)
+            self.log.propagate = False
+            self.log_fh = logging.FileHandler(path)
+            self.log.addHandler(self.log_fh)
+
+    def init_rules(self):
+        for section in self.config.sections():
+            if section == 'DEFAULT':
+                continue
+
+            rule = PulseAudioControl.Rule(self.config[section])
+            self.rules.append(rule)
+            self.log.debug(f"Added rule: {rule}")
+        
+        if len(self.rules) == 0 and not self.args.interactive:
+            self.log.error("No rules are defined.  Do you need to create a config?")
+
+    def get_matching_midi_device(self, device_list, name):
+        for device in device_list:
+            if re.match(name, device):
+                return device
+    
+    def print(self, msg, color=37):
+        print(f"\033[1;{color}m{msg}\033[0m")
+
+    def input(self, msg, color=36):
+        return input(f"\033[1;{color}m{msg}\033[0m")
+
+    def get_confirmation(self, prompt, default=False):
+        yn = (default and "Y/n") or "y/N"
+
+        while True:
+            selection = self.input(f"{prompt} [{yn}]? ")
+            if selection == "":
+                return default
+            elif re.match("^y", selection, re.I):
+                return True
+            elif re.match("^n", selection, re.I):
+                return False
+
+    def get_selection_from_list(self, list, default, prompt="Select from list", title=None, examples=None):
+        num = 1
+        default_num = 1
+        
+        if title:
+            self.print(f"{title}\n", color=32)
+            
+        for item in list:
+            if item == default:
+                default_num = num
+            
+            choice = f"\t[{num}] {item}"
+            if examples:
+                choice += f" ({examples[num-1]})"
+
+            self.print(choice)
+            num += 1
+        
+        self.print("")
+        while True:
+            selected = self.input(f"{prompt} [{default_num}]: ")
+            if selected == "":
+                return list[default_num-1]
+            elif selected.isnumeric():
+                num = int(selected)
+                if num >= 1 and num <= len(list):
+                    return list[num-1]
+
+    def init_midi(self):
+        self.midi_in = None
+        self.midi_out = None
+
+        device = None
+        pattern = self.config.get('DEFAULT', 'midi_device', 
+                                  fallback='^((?!Midi Through).*)$')
+        output = self.config.getboolean("DEFAULT", 'midi_output', fallback=True)
+
+        input_names = mido.get_input_names()
+
+        if pattern:
+            device = self.get_matching_midi_device(input_names, pattern)
+
+        if self.args.interactive:
+            device = self.get_selection_from_list(input_names, device,
+                                                  "Select MIDI device",
+                                                  "Available MIDI devices")
+            output = self.get_confirmation("Device supports output", default=True)
+            self.i_config.set("DEFAULT", "midi_device", device)
+            self.i_config.set("DEFAULT", "midi_output", str(output))
+
+        if device:
+            self.log.debug(f"Opening MIDI device: {device}")
+            self.midi_in = mido.open_input(device, callback=self.midi_callback)
+
+            if output:
+                self.midi_out = mido.open_output(device)
+
+    def init_audio(self):
+        self.log.debug("Opening Pulse Audio")
+        self.pulse = pulsectl.Pulse('pakontrol')
+        self.pulse.event_mask_set('all')
+        self.pulse.event_callback_set(self.audio_callback)
+
+    def get_matching_midi_rule(self, msg):
+        for rule in self.rules:
+            self.log.debug(f"Considering rule {rule} for {msg}")
+            if (rule.midi_event == msg.type
+                and rule.midi_channel == msg.channel
+                and rule.midi_control == msg.control):
+                    return rule
+
+    def apply_midi_rule(self, rule, value):
+        device = self.get_matching_audio_device(rule)
+        
+        if rule.pa_change == 'volume':
+            volume = min(value / MAX_MIDI_VALUE * rule.pa_factor, MAX_VOLUME)
+
+            if self.args.interactive and rule != self.i_rule:
+                self.log.info(f"Would set volume of {device} to {volume} (skipped in interactive mode)")
+            else:
+                self.log.info(f"Setting volume of {device} to {volume}")
+                self.pulse.volume_set_all_chans(device, volume)
+
+        elif rule.pa_change == 'mute' and value != 0:
+            if self.args.interactive and rule != self.i_rule:
+                self.log.info(f"Would toggle mute of {device} (skipped in interactive mode)")
+            else:
+                self.log.info(f"Toggling mute of {device}")
+                self.pulse.mute(device, not device.mute)
+
+    def midi_callback(self, msg):
+        self.midi_events.append(msg)
+
+    def create_midi_rule(self, msg):
+        self.log.info(f"Received MIDI message {msg}")
+        key = f"{msg.type}:{msg.channel}:{msg.control}"
+
+        if key not in self.i_asked and self.get_confirmation("Create a rule for this control"):
+            new_rule = PulseAudioControl.Rule()
+            new_rule.midi_event = msg.type
+            new_rule.midi_channel = msg.channel
+            new_rule.midi_control = msg.control
+            new_rule.midi_output = self.get_confirmation("Should this control receive output")
+            self.i_rule = new_rule
+            self.i_step = "audio"
+            self.print("Next use your PulseAudio mixer to mute or change "
+                    "the volume of the device you want to control")
+        
+        self.i_asked[key] = True
+
+    def process_midi_events(self):
+        while len(self.midi_events) > 0:
+            msg = self.midi_events.pop()
+            rule = self.get_matching_midi_rule(msg)
+
+            if rule:
+                self.apply_midi_rule(rule, msg.value)
+
+            if self.args.interactive and self.i_step == "midi":
+                self.create_midi_rule(msg)
+
+    def get_audio_device_list(self, type):
+        if type == "sink":
+            return self.pulse.sink_list()
+        elif type == "sink_input":
+            return self.pulse.sink_input_list()
+        elif type == "source":
+            return self.pulse.source_list()
+        elif type == "source_output":
+            return self.pulse.source_output_list()
+        else:
+            self.log.debug(f"Unknown audio device type: {type}")
+            return []
+
+    def get_audio_device(self, type, index):
+        list = self.get_audio_device_list(type)
+
+        for device in list:
+            if device.index == index:
+                return device
+
+    def get_matching_audio_device(self, rule):
+        list = self.get_audio_device_list(rule.pa_type)
+
+        for device in list:
+            self.log.debug(f"Considering device {device} for {rule}")
+            if rule.pa_match_name and not re.match(rule.pa_match_name, device.name):
+                continue
+
+            if rule.pa_match_prop_named:
+                if rule.pa_match_prop_named not in device.proplist:
+                    continue
+
+                if not re.match(rule.pa_match_prop_value, device.proplist[rule.pa_match_prop_named]):
+                    continue
+
+            return device        
+
+    def get_matching_audio_rules(self, type, device):
+        rules = []
+
+        for rule in self.rules:
+            if rule.pa_type != type:
+                continue
+            
+            if rule.pa_match_name:
+                if not re.match(rule.pa_match_name, device.name):
+                    continue
+            
+            if rule.pa_match_prop_named and rule.pa_match_prop_value:
+                if rule.pa_match_prop_named not in device.proplist:
+                    continue
+                
+                if not re.match(rule.pa_match_prop_value, device.proplist[rule.pa_match_prop_named]):
+                    continue
+
+            rules.append(rule)
+        
+        return rules
+        
+    def apply_audio_rule(self, rule, device):
+        msg = Message(rule.midi_event, 
+                      channel=rule.midi_channel, 
+                      control=rule.midi_control)
+        
+        if not rule.midi_output:
+            return
+        
+        if rule.pa_change == 'volume':           
+            msg.value = min(int(device.volume.value_flat / rule.pa_factor * MAX_MIDI_VALUE), MAX_MIDI_VALUE)
+
+        elif rule.pa_change == 'mute':
+            msg.value = (device.mute and MAX_MIDI_VALUE) or MIN_MIDI_VALUE
+
+        if self.midi_out:
+            self.log.info(f"Sending midi msg: {msg}")
+            self.midi_out.send(msg)
+
+    def create_audio_rule(self, type, device):
+        self.log.info(f"Device changed {type}:{device.name}")
+        key = f"audio:{type}:{device.name}"
+
+        if key not in self.i_asked and self.get_confirmation("Add this device to the current rule"):
+            
+            self.print("Some devices can have names that are ambiguous or change.", color=31)
+            
+            if self.get_selection_from_list(["name", "property"], "name", 
+                                            "Match on which", 
+                                            "Rules can match on name or property") == "property":
+                
+                prop_name = self.get_selection_from_list(
+                    list(device.proplist.keys()), "application.name", "Which property",
+                    examples=list(device.proplist.values()))
+            
+                self.i_rule.pa_match_prop_named = prop_name
+                self.i_rule.pa_match_prop_value = device.proplist[prop_name]
+            else:
+                self.i_rule.pa_match_name = device.name
+
+            self.i_rule.pa_type = type            
+            self.i_rule.pa_change = self.get_selection_from_list(["volume", "mute"], "volume", "Connect to which", "Volume or Mute")
+            self.i_step = "test"
+            self.i_test_until = time.time() + 30
+
+            self.rules.append(self.i_rule)
+            self.print("This rule is now active.  You now have 30 seconds "
+                  "to try it out before confirming to save.", color=31)
+        
+        self.i_asked[key] = True
+
+    def process_audio_events(self):
+        while len(self.audio_events):
+            evt = self.audio_events.pop()
+            type = evt.facility._value
+            index = evt.index
+            
+            # We cannot tell from the event itself whether the volume or mute
+            # was changed, so we apply to all matching rules
+            device = self.get_audio_device(type, index)
+            rules = self.get_matching_audio_rules(type, device)
+
+            for rule in rules:
+                self.apply_audio_rule(rule, device)
+
+            if self.args.interactive and self.i_step == "audio" and device:
+                self.create_audio_rule(type, device)
+
+    def audio_callback(self, evt):
+        # We cannot process the events in pulsectl's event loop
+        # Just add them to a queue and we'll get them in the next go around
+        self.audio_events.append(evt)
+
+    def interactive_welcome(self):
+        self.print("You are now entering interactive mode.  In this mode you will create new rules by")
+        self.print("interacting with your midi device and a pulse audio mixer like pavucontrol.")
+        self.print("Start by using a control on your MIDI device...")
+
+    def handle_interactive_test(self):
+        if self.args.interactive and self.i_step == "test":
+            if time.time() > self.i_test_until:
+                self.print("Testing complete.", color=31)
+
+                if self.get_confirmation("Save this rule"):
+                    name = self.input("Rule Name: ")
+                    self.i_config.add_section(name)
+                    self.i_config.set(name, "midi_event", self.i_rule.midi_event)
+                    self.i_config.set(name, "midi_channel", str(self.i_rule.midi_channel))
+                    self.i_config.set(name, "midi_control", str(self.i_rule.midi_control))
+                    self.i_config.set(name, "midi_output", str(self.i_rule.midi_output))
+                    self.i_config.set(name, "pa_type", self.i_rule.pa_type)
+                    self.i_config.set(name, "pa_change", self.i_rule.pa_change)
+
+                    if self.i_rule.pa_match_name:
+                        self.i_config.set(name, "pa_match_name", self.i_rule.pa_match_name)
+
+                    if self.i_rule.pa_match_prop_named:
+                        self.i_config.set(name, "pa_match_prop_named", self.i_rule.pa_match_prop_named)
+                        self.i_config.set(name, "pa_match_prop_value", self.i_rule.pa_match_prop_value)
+
+                if self.get_confirmation("Create another rule", default=True):
+                    self.i_step = "midi"
+                    self.i_rule = None
+                    self.i_test_until = None
+                    self.i_asked = {}
+                    self.print("Use a control on your MIDI device...")
+                else:
+                    with open('pakontrol-new.conf','w') as configfile:
+                        self.i_config.write(configfile)
+                    self.print("Configuration written to pakontrol-new.conf.")
+                    self.print("Configuration is loaded from ~/.config/pakontrol/pakontrol.conf by default.")
+                    sys.exit(0)
+    
+    def run(self):
+        if self.args.interactive:
+            self.interactive_welcome()
+
+        while True:
+            self.pulse.event_listen(timeout=0.25)
+            self.process_audio_events()
+            self.process_midi_events()
+            self.handle_interactive_test()
+
+if __name__ == "__main__":
+    def signal_handler(sig, frame):
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    pac = PulseAudioControl()
+    pac.run()
