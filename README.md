@@ -53,6 +53,7 @@ to mute button and volume slider).  See `pakcontrol.conf.sample` for examples.
 * `midi_control` - Control number
 * `pa_type` - PulseAudio device type, one of `sink`, `sink_input`, `source`, `source_input`
 * `pa_change` - Property to change/watch, one of `volume`, `mute`
+* `pa_factor` - Float multiplied by to map to volumes above 100%.  Defaults to 1.0.
 * `pa_match_name` - Name of device to regex match on (optional)
 * `pa_match_prop_named` - Name of property to match on (optional)
 * `pa_match_prop_value` - Value of property to regex match on (optional)
